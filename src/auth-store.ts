@@ -1,4 +1,5 @@
 import { access, chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import type { Stats } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -387,6 +388,21 @@ async function pause(ms: number, signal?: AbortSignal): Promise<void> {
   }
 }
 
+// The lock holds its owner's PID. An empty lock means the owner has not written it yet.
+async function lockOwnerGone(lockPath: string, lock: Stats): Promise<boolean> {
+  const pid = Number.parseInt(await readFile(lockPath, 'utf8'), 10)
+  if (!(pid > 0)) return false
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return false
+  }
+  // The owner can release the lock and exit while we read it. Reclaim only the lock that we examined.
+  const current = await stat(lockPath)
+  return current.ino === lock.ino && current.mtimeMs === lock.mtimeMs
+}
+
 export function getMultiAuthPath(): string {
   return join(getAgentDir(), MULTIPROVIDER_AUTH_FILE)
 }
@@ -699,7 +715,7 @@ export class MultiAuthStore {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
         try {
           const lock = await stat(this.lockPath)
-          if (Date.now() - lock.mtimeMs > LOCK_STALE_MS) {
+          if (Date.now() - lock.mtimeMs > LOCK_STALE_MS || (await lockOwnerGone(this.lockPath, lock))) {
             await unlink(this.lockPath)
             continue
           }
@@ -715,6 +731,7 @@ export class MultiAuthStore {
     }
 
     try {
+      await handle.writeFile(String(process.pid))
       return await operation()
     } finally {
       await handle.close().catch(() => undefined)
