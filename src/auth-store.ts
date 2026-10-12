@@ -1,6 +1,6 @@
 import { access, chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import type { Stats } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, hostname } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type {
@@ -388,10 +388,12 @@ async function pause(ms: number, signal?: AbortSignal): Promise<void> {
   }
 }
 
-// The lock holds its owner's PID. An empty lock means the owner has not written it yet.
+// The lock holds its owner's host and PID. An empty lock means the owner has not written them yet.
+// A PID from a different host (for example, on a shared home directory) does not show if that owner is alive.
 async function lockOwnerGone(lockPath: string, lock: Stats): Promise<boolean> {
-  const pid = Number.parseInt(await readFile(lockPath, 'utf8'), 10)
-  if (!(pid > 0)) return false
+  const [host, id] = (await readFile(lockPath, 'utf8')).split(' ')
+  const pid = Number(id)
+  if (host !== hostname() || !(pid > 0)) return false
   try {
     process.kill(pid, 0)
     return false
@@ -731,7 +733,7 @@ export class MultiAuthStore {
     }
 
     try {
-      await handle.writeFile(String(process.pid))
+      await handle.writeFile(`${hostname()} ${process.pid}`)
       return await operation()
     } finally {
       await handle.close().catch(() => undefined)
