@@ -563,6 +563,46 @@ const isLiftOf = (current: Provider<Api> | undefined, lift: Provider<Api> | unde
   current !== undefined && lift !== undefined
   && (current === lift || (lift.headers !== undefined && current.headers === lift.headers))
 
+// Pi loads one instance of this extension per session, and subagent sessions
+// share the parent's provider registry. Each instance lifts the real base
+// provider, never another instance's lift, so shutting one instance down cannot
+// break a chain of wrappers. This process-wide list of live registrations (lifts
+// and virtual providers) decides what a departing instance hands the registry
+// back to, in whatever order sessions end.
+const LIFTED_BASE = Symbol.for('pi-multiprovider.lifted-base')
+type LiftedProvider = Provider<Api> & { [LIFTED_BASE]: Provider<Api> }
+const liveProviders: Map<string, Provider<Api>[]> = ((globalThis as unknown as Record<symbol, Map<string, Provider<Api>[]> | undefined>)[
+  Symbol.for('pi-multiprovider.live-providers')
+] ??= new Map())
+
+// The registry's copy of another instance's lift may be Pi's composed wrapper,
+// which carries no tag of its own; match it against the live lifts instead.
+const realBase = (providerId: string, provider: Provider<Api> | undefined): Provider<Api> | undefined => {
+  let base = provider
+  while (base !== undefined) {
+    const candidate: Provider<Api> = base
+    const lift = LIFTED_BASE in candidate
+      ? candidate
+      : liveProviders.get(providerId)?.find(live => LIFTED_BASE in live && isLiftOf(candidate, live))
+    if (lift === undefined) break
+    base = (lift as LiftedProvider)[LIFTED_BASE]
+  }
+  return base
+}
+
+/** Swaps `previous` for `next` among the live registrations and returns the newest one left. */
+const replaceLiveProvider = (
+  providerId: string,
+  previous: Provider<Api> | undefined,
+  next?: Provider<Api>,
+): Provider<Api> | undefined => {
+  const live = (liveProviders.get(providerId) ?? []).filter(provider => provider !== previous)
+  if (next !== undefined) live.push(next)
+  if (live.length === 0) liveProviders.delete(providerId)
+  else liveProviders.set(providerId, live)
+  return live.at(-1)
+}
+
 export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   const service = new MultiProviderService()
   const store = new MultiAuthStore()
@@ -579,6 +619,18 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   const virtualProviders = new Map<string, Provider<Api>>()
   const virtualIntegrations = new Map<string, ProviderRegistration<VirtualBackendRef>>()
   let currentContext: ExtensionContext | undefined
+  // Provider callbacks run on every request and can outlive the context that
+  // registered them: a Pi subagent loads this extension into a child session
+  // that shares the parent's provider registry, and pi marks that session's
+  // context stale once it is disposed. Keep plain values for those callbacks;
+  // dereferencing a stale context throws and fails every later request.
+  let currentSessionId: string | undefined
+  let currentModelRegistry: ExtensionContext['modelRegistry'] | undefined
+  const trackContext = (ctx: ExtensionContext): void => {
+    currentContext = ctx
+    currentSessionId = ctx.sessionManager.getSessionId()
+    currentModelRegistry = ctx.modelRegistry
+  }
   let pendingSessionPins: SessionPin[] = []
   let pendingInheritedSessionPins: InheritedSessionPin[] = []
 
@@ -701,7 +753,8 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     const base = baseProviders.get(providerId)
     const installed = installedProviders.get(providerId)
     const current = ctx?.modelRegistry.getProvider(providerId)
-    if (base !== undefined && (ctx === undefined || isLiftOf(current, installed))) pi.registerProvider(base)
+    const newestLiveLift = replaceLiveProvider(providerId, installed)
+    if (base !== undefined && (ctx === undefined || isLiftOf(current, installed))) pi.registerProvider(newestLiveLift ?? base)
     installedProviders.delete(providerId)
     baseProviders.delete(providerId)
     registeredIntegrations.delete(providerId)
@@ -718,7 +771,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
 
     const current = ctx.modelRegistry.getProvider(providerId) as Provider<Api> | undefined
     const priorLift = installedProviders.get(providerId)
-    const base = isLiftOf(current, priorLift) ? baseProviders.get(providerId) : current
+    const base = realBase(providerId, isLiftOf(current, priorLift) ? baseProviders.get(providerId) : current)
     if (base === undefined) {
       if (!warnedMissing.has(providerId)) {
         warnedMissing.add(providerId)
@@ -750,8 +803,8 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     }
 
     if (isLiftOf(current, priorLift) && baseProviders.get(providerId) === base) return
-    const affinityKey = integration.affinityKey
-      ?? (() => ctx.sessionManager.getSessionId())
+    const sessionId = ctx.sessionManager.getSessionId()
+    const affinityKey = integration.affinityKey ?? (() => sessionId)
     const lifted: Provider<Api> = {
       ...liftProvider(base, service, {
         ...integration,
@@ -761,6 +814,8 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       // A headers object of its own lets isLiftOf() see through Pi's composition.
       headers: { ...base.headers },
     }
+    Object.defineProperty(lifted, LIFTED_BASE, { value: base })
+    replaceLiveProvider(providerId, priorLift, lifted)
     pi.registerProvider(lifted)
     baseProviders.set(providerId, base)
     installedProviders.set(providerId, lifted)
@@ -778,7 +833,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     for (const providerId of storedIds) {
       const current = ctx.modelRegistry.getProvider(providerId) as Provider<Api> | undefined
       const priorLift = installedProviders.get(providerId)
-      const base = isLiftOf(current, priorLift) ? baseProviders.get(providerId) : current
+      const base = realBase(providerId, isLiftOf(current, priorLift) ? baseProviders.get(providerId) : current)
       if (base === undefined) continue
       if (managedBases.get(providerId) !== base) {
         managedBases.set(providerId, base)
@@ -811,6 +866,8 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       if (prior !== undefined) unregisterVirtualModels(prior)
       virtualConfigs.delete(providerId)
       if (virtualProviders.has(providerId)) {
+        // Deleted from the shared store: every session's registration is obsolete.
+        liveProviders.delete(providerId)
         pi.unregisterProvider(providerId)
         virtualProviders.delete(providerId)
       }
@@ -823,7 +880,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     const resolveTemplate = (providerId: string, modelId: string): VirtualModelTemplate | undefined => {
       const provider = installedProviders.get(providerId)
         ?? baseProviders.get(providerId)
-        ?? currentContext?.modelRegistry.getProvider(providerId) as Provider<Api> | undefined
+        ?? currentModelRegistry?.getProvider(providerId) as Provider<Api> | undefined
       const model = provider?.getModels().find(item => item.id === modelId)
       return model === undefined ? undefined : captureVirtualModelTemplate(model)
     }
@@ -842,11 +899,10 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       if (prior !== undefined) unregisterVirtualModels(prior)
 
       // Registration runs at extension load, before any session exists; the
-      // closures only dereference the context once a session is streaming.
-      const sessionContext = (): ExtensionContext | undefined => currentContext
+      // closures only read the session snapshot once a session is streaming.
       const providerLabel = (providerId: string): string | undefined =>
         baseProviders.get(providerId)?.name
-        ?? sessionContext()?.modelRegistry.getProvider(providerId)?.name
+        ?? currentModelRegistry?.getProvider(providerId)?.name
 
       const integrations = createVirtualIntegrations(config, { getProviderLabel: providerLabel })
       for (const integration of integrations) {
@@ -859,17 +915,17 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         service,
         config,
         onFailover: handleFailover,
-        getAffinityKey: () => sessionContext()?.sessionManager.getSessionId() ?? '',
+        getAffinityKey: () => currentSessionId ?? '',
         getBackingProvider: providerId =>
           installedProviders.get(providerId)
           ?? baseProviders.get(providerId)
-          ?? sessionContext()?.modelRegistry.getProvider(providerId) as Provider<Api> | undefined,
+          ?? currentModelRegistry?.getProvider(providerId) as Provider<Api> | undefined,
         isBackendConfigured: providerId =>
-          sessionContext()?.modelRegistry.getProviderAuthStatus(providerId).configured ?? true,
+          currentModelRegistry?.getProviderAuthStatus(providerId).configured ?? true,
         resolveAmbientAuth: async (_providerId, model, signal) => {
-          const context = sessionContext()
-          if (context === undefined) return { ok: false, error: 'multiprovider: session not ready' }
-          const resolution = await context.modelRegistry.getApiKeyAndHeaders(model)
+          const registry = currentModelRegistry
+          if (registry === undefined) return { ok: false, error: 'multiprovider: session not ready' }
+          const resolution = await registry.getApiKeyAndHeaders(model)
           if (!resolution.ok) return { ok: false, error: resolution.error }
           return {
             ok: true,
@@ -880,6 +936,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           }
         },
       })
+      replaceLiveProvider(config.id, virtualProviders.get(config.id), virtualProvider)
       pi.registerProvider(virtualProvider)
       virtualProviders.set(config.id, virtualProvider)
       virtualConfigs.set(config.id, config)
@@ -1002,7 +1059,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   })
 
   pi.on('session_start', async (_event, ctx) => {
-    currentContext = ctx
+    trackContext(ctx)
     pendingSessionPins = sessionPinsFromEntries(ctx.sessionManager.getEntries())
     const recordedPools = new Set(pendingSessionPins.map(pin => pin.pool))
     pendingInheritedSessionPins = inheritedSessionPinsFromEnv(process.env)
@@ -1012,7 +1069,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   })
 
   pi.on('before_agent_start', async (_event, ctx) => {
-    currentContext = ctx
+    trackContext(ctx)
     await reconcile(ctx)
   })
 
@@ -1021,7 +1078,13 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     for (const providerId of installedProviders.keys()) restoreProvider(providerId, currentContext)
     managedIntegrations.clear()
     managedBases.clear()
-    for (const providerId of virtualProviders.keys()) pi.unregisterProvider(providerId)
+    for (const [providerId, provider] of virtualProviders) {
+      const newest = replaceLiveProvider(providerId, provider)
+      // Another live session registered this id after us; leave its registration.
+      if (currentModelRegistry !== undefined && currentModelRegistry.getProvider(providerId) !== provider) continue
+      if (newest === undefined) pi.unregisterProvider(providerId)
+      else pi.registerProvider(newest)
+    }
     virtualProviders.clear()
     virtualIntegrations.clear()
     virtualConfigs.clear()
